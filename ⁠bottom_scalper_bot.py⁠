@@ -1,0 +1,535 @@
+import os
+import time
+import json
+import asyncio
+import requests
+import websockets
+import ccxt
+
+# ============================================================
+# PAPER TRADING ONLY — تداول افتراضي فقط
+# ============================================================
+
+TELEGRAM_BOT_TOKEN = "8865534447:AAEIt4Jke_zS4yxXWa46XJSsf8d-UzjjGPs"
+CHAT_ID = "5680942261"
+
+exchange = ccxt.binance({
+    "enableRateLimit": True,
+    "options": {"defaultType": "spot"},
+    "timeout": 30000,
+})
+
+INITIAL_CAPITAL = 1000.0
+current_capital = INITIAL_CAPITAL
+
+TIMEFRAME = "15m"
+CANDLE_LIMIT = 672  # 7 أيام لحساب الـ VAL بدقة
+MIN_QUOTE_VOLUME = 2_000_000
+MAX_TRADE_DURATION = 2.5 * 3600
+
+TAKE_PROFIT_PCT = 0.02
+STOP_LOSS_PCT = 0.01
+
+FEE_RATE = 0.001
+SLIPPAGE_RATE = 0.0005
+
+TRAIL_ACTIVATION_PCT = 0.008
+TRAIL_DISTANCE_PCT = 0.006
+
+# --- التعديلات المخففة لاصتياد فرص أكثر وسرعة أكبر ---
+MIN_BOUNCE_PCT = 0.4        # تم تخفيض نسبة الارتداد المطلوبة إلى 0.4%
+BOUNCE_HOLD_SECONDS = 15    # تم تخفيض وقت الانتظار إلى 15 ثانية فقط
+MAX_CANDIDATES = 30
+
+VAL_MIN_DISTANCE_PCT = -0.8
+VAL_MAX_DISTANCE_PCT = 2.0
+
+monitoring_bounces = {}
+active_trade = None
+
+total_wins = 0
+total_losses = 0
+total_timeouts = 0
+total_trades = 0
+total_fees = 0.0
+
+equity_peak = INITIAL_CAPITAL
+max_drawdown_pct = 0.0
+
+EXCLUDED_BASES = {
+    "USDC", "FDUSD", "TUSD", "USDP", "EUR",
+    "BTC", "ETH", "PAXG", "XAUT", "USDE",
+    "RLUSD", "USD1", "XUSD"
+}
+
+
+def send_telegram_message(message):
+    if not TELEGRAM_BOT_TOKEN or not CHAT_ID:
+        return
+
+    try:
+        url = (
+            "https://api.telegram.org/bot"
+            f"{TELEGRAM_BOT_TOKEN}/sendMessage"
+        )
+        response = requests.post(
+            url,
+            json={
+                "chat_id": CHAT_ID,
+                "text": message
+            },
+            timeout=10
+        )
+
+        if response.status_code != 200:
+            print("Telegram error:", response.text)
+
+    except Exception as exc:
+        print("Telegram exception:", exc)
+
+
+def ema(values, period):
+    if len(values) < period:
+        return None
+
+    result = sum(values[:period]) / period
+    alpha = 2.0 / (period + 1)
+
+    for value in values[period:]:
+        result = alpha * value + (1 - alpha) * result
+
+    return result
+
+
+def calculate_val_15m_7days(ohlcv, num_bins=50):
+    """
+    تقدير VAL من Volume Profile لـ 7 أيام (672 شمعة).
+    """
+    if not ohlcv or len(ohlcv) < 200:
+        return None
+
+    candles = ohlcv[:-1]
+    lows = [float(c[3]) for c in candles]
+    highs = [float(c[2]) for c in candles]
+
+    min_price = min(lows)
+    max_price = max(highs)
+
+    if min_price <= 0 or max_price <= min_price:
+        return None
+
+    bin_size = (max_price - min_price) / num_bins
+    profile = [0.0] * num_bins
+
+    for candle in candles:
+        low = float(candle[3])
+        high = float(candle[2])
+        volume = float(candle[5])
+
+        if volume <= 0:
+            continue
+
+        candle_range = high - low
+        if candle_range <= 0:
+            index = int((low - min_price) / bin_size)
+            index = max(0, min(num_bins - 1, index))
+            profile[index] += volume
+            continue
+
+        first = max(0, int((low - min_price) / bin_size))
+        last = min(num_bins - 1, int((high - min_price) / bin_size))
+
+        for index in range(first, last + 1):
+            bin_low = min_price + index * bin_size
+            bin_high = bin_low + bin_size
+            overlap = max(0.0, min(high, bin_high) - max(low, bin_low))
+
+            if overlap > 0:
+                profile[index] += volume * overlap / candle_range
+
+    total_volume = sum(profile)
+    if total_volume <= 0:
+        return None
+
+    poc = profile.index(max(profile))
+    target_volume = total_volume * 0.70
+
+    left = right = poc
+    accumulated = profile[poc]
+
+    while accumulated < target_volume:
+        left_volume = profile[left - 1] if left > 0 else -1
+        right_volume = profile[right + 1] if right < num_bins - 1 else -1
+
+        if right_volume > left_volume and right < num_bins - 1:
+            right += 1
+            accumulated += profile[right]
+        elif left > 0:
+            left -= 1
+            accumulated += profile[left]
+        else:
+            break
+
+    return min_price + left * bin_size
+
+
+def relaxed_trend_filter(closes):
+    """
+    فلتر اتجاه مخفف ومرن (بدون RSI وبدون شروط معقدة).
+    """
+    if len(closes) < 30:
+        return True
+    
+    # تأكيد أولي أن الشمعة الأخيرة ليست في قاع مطلق عميق دون أي محاولة صعود
+    last_close = closes[-1]
+    previous_close = closes[-2]
+    
+    if last_close < previous_close * 0.97:
+        return False  # استبعاد الهبوط الحاد الفجائي فقط
+        
+    return True
+
+
+def update_drawdown():
+    global equity_peak, max_drawdown_pct
+    equity_peak = max(equity_peak, current_capital)
+    if equity_peak > 0:
+        drawdown = ((equity_peak - current_capital) / equity_peak) * 100
+        max_drawdown_pct = max(max_drawdown_pct, drawdown)
+
+
+def get_market_symbols():
+    try:
+        markets = exchange.load_markets()
+        tickers = exchange.fetch_tickers()
+        candidates = []
+
+        for symbol, market in markets.items():
+            if not market.get("active", True) or not market.get("spot", False) or not symbol.endswith("/USDT"):
+                continue
+
+            base = symbol.split("/")[0]
+            if base in EXCLUDED_BASES:
+                continue
+
+            ticker = tickers.get(symbol)
+            if not ticker:
+                continue
+
+            quote_volume = ticker.get("quoteVolume")
+            if quote_volume is None or float(quote_volume) < MIN_QUOTE_VOLUME:
+                continue
+
+            last_price = ticker.get("last")
+            low_24h = ticker.get("low")
+            if not last_price or not low_24h or low_24h <= 0:
+                continue
+
+            distance_from_low = ((float(last_price) - float(low_24h)) / float(low_24h)) * 100
+            if distance_from_low > 12:
+                continue
+
+            candidates.append({
+                "symbol": symbol,
+                "price": float(last_price),
+                "volume": float(quote_volume),
+                "distance_from_low": distance_from_low
+            })
+
+        candidates.sort(key=lambda item: (item["volume"], -item["distance_from_low"]), reverse=True)
+        return candidates[:MAX_CANDIDATES]
+
+    except Exception as exc:
+        print("خطأ في جلب العملات:", exc)
+        return []
+
+
+async def scan_for_candidates():
+    global monitoring_bounces
+
+    markets = await asyncio.to_thread(get_market_symbols)
+    now = time.time()
+    found_symbols = set()
+
+    for market in markets:
+        symbol = market["symbol"]
+
+        try:
+            ohlcv = await asyncio.to_thread(
+                exchange.fetch_ohlcv,
+                symbol,
+                TIMEFRAME,
+                None,
+                CANDLE_LIMIT
+            )
+
+            if not ohlcv or len(ohlcv) < 200:
+                continue
+
+            closed_candles = ohlcv[:-1]
+            closes = [float(c[4]) for c in closed_candles]
+
+            val = calculate_val_15m_7days(ohlcv)
+            if val is None or val <= 0:
+                continue
+
+            ticker = await asyncio.to_thread(exchange.fetch_ticker, symbol)
+            price = ticker.get("last")
+
+            if not price or price <= 0:
+                continue
+
+            price = float(price)
+            found_symbols.add(symbol)
+
+            distance_to_val = ((price - val) / val) * 100
+
+            if not (VAL_MIN_DISTANCE_PCT <= distance_to_val <= VAL_MAX_DISTANCE_PCT):
+                monitoring_bounces.pop(symbol, None)
+                continue
+
+            if not relaxed_trend_filter(closes):
+                monitoring_bounces.pop(symbol, None)
+                continue
+
+            if symbol not in monitoring_bounces:
+                monitoring_bounces[symbol] = {
+                    "base_low": price,
+                    "started_at": now,
+                    "bounce_started_at": None,
+                    "last_price": price,
+                    "val": val
+                }
+                print(f"[مراقبة مرنة] {symbol} | السعر={price:.8g} | VAL={val:.8g}")
+                continue
+
+            state = monitoring_bounces[symbol]
+
+            if price < state["base_low"]:
+                state["base_low"] = price
+                state["bounce_started_at"] = None
+                state["started_at"] = now
+                state["last_price"] = price
+                state["val"] = val
+                continue
+
+            base_low = state["base_low"]
+            if base_low <= 0:
+                monitoring_bounces.pop(symbol, None)
+                continue
+
+            bounce_pct = ((price - base_low) / base_low) * 100
+
+            if bounce_pct >= MIN_BOUNCE_PCT:
+                if state["bounce_started_at"] is None:
+                    state["bounce_started_at"] = now
+                elif now - state["bounce_started_at"] >= BOUNCE_HOLD_SECONDS:
+                    if price >= state["last_price"]:
+                        print(f"[إشارة شراء سريعة] {symbol} | ارتداد {bounce_pct:.2f}%")
+                        await open_paper_trade(symbol, price, val)
+                        monitoring_bounces.pop(symbol, None)
+                        if active_trade is not None:
+                            return
+                    else:
+                        state["bounce_started_at"] = None
+            else:
+                state["bounce_started_at"] = None
+
+            state["last_price"] = price
+            state["val"] = val
+
+            await asyncio.sleep(0.05)
+
+        except Exception as exc:
+            print(f"خطأ أثناء فحص {symbol}: {exc}")
+
+    for symbol in list(monitoring_bounces):
+        if symbol not in found_symbols:
+            monitoring_bounces.pop(symbol, None)
+
+
+async def open_paper_trade(symbol, market_price, val):
+    global active_trade, current_capital
+
+    if active_trade is not None or current_capital <= 0 or market_price <= 0:
+        return
+
+    capital_used = current_capital
+    entry_price = market_price * (1 + SLIPPAGE_RATE)
+    entry_fee = capital_used * FEE_RATE
+    investment_after_fee = capital_used - entry_fee
+
+    if investment_after_fee <= 0:
+        return
+
+    quantity = investment_after_fee / entry_price
+    current_capital -= capital_used
+
+    active_trade = {
+        "symbol": symbol,
+        "entry_price": entry_price,
+        "market_entry_price": market_price,
+        "quantity": quantity,
+        "capital_used": capital_used,
+        "entry_fee": entry_fee,
+        "entry_time": time.time(),
+        "val": val,
+        "tp": entry_price * (1 + TAKE_PROFIT_PCT),
+        "sl": entry_price * (1 - STOP_LOSS_PCT),
+        "highest_price": entry_price,
+        "trailing_active": False,
+        "trailing_stop": None
+    }
+
+    global total_fees
+    total_fees += entry_fee
+
+    print(
+        f"\n[دخول افتراضي سريع] {symbol}\n"
+        f"المبلغ: {capital_used:.4f} USDT | الدخول: {entry_price:.8g}\n"
+        f"TP: {active_trade['tp']:.8g} | SL: {active_trade['sl']:.8g}\n"
+    )
+
+    send_telegram_message(
+        f"🟢 صفقة افتراضية جديدة (إشارة سريعة)\n"
+        f"العملة: {symbol}\n"
+        f"الدخول: {entry_price:.8g}\n"
+        f"TP: {active_trade['tp']:.8g} | SL: {active_trade['sl']:.8g}"
+    )
+
+
+async def close_paper_trade(exit_market_price, reason):
+    global active_trade, current_capital
+    global total_wins, total_losses, total_timeouts, total_trades, total_fees
+
+    trade = active_trade
+    if trade is None:
+        return
+
+    exit_price = exit_market_price * (1 - SLIPPAGE_RATE)
+    gross_proceeds = trade["quantity"] * exit_price
+    exit_fee = gross_proceeds * FEE_RATE
+    net_proceeds = gross_proceeds - exit_fee
+
+    current_capital += net_proceeds
+    total_fees += exit_fee
+
+    pnl = net_proceeds - trade["capital_used"]
+    pnl_pct = (pnl / trade["capital_used"] * 100) if trade["capital_used"] > 0 else 0
+
+    total_trades += 1
+    if pnl > 0:
+        total_wins += 1
+    elif pnl < 0:
+        total_losses += 1
+
+    if reason == "TIMEOUT":
+        total_timeouts += 1
+
+    duration = time.time() - trade["entry_time"]
+
+    print(
+        f"\n[إغلاق صفقة] {trade['symbol']} | السبب: {reason}\n"
+        f"PnL: {pnl:+.4f} USDT ({pnl_pct:+.2f}%)\n"
+        f"الرصيد الحالي: {current_capital:.4f} USDT"
+    )
+
+    send_telegram_message(
+        f"🔴 إغلاق صفقة: {trade['symbol']}\n"
+        f"السبب: {reason}\n"
+        f"الربح/الخسارة: {pnl:+.4f} USDT ({pnl_pct:+.2f}%)\n"
+        f"الرصيد: {current_capital:.4f} USDT"
+    )
+
+    active_trade = None
+    update_drawdown()
+
+
+async def monitor_active_trade():
+    global active_trade
+
+    while active_trade is not None:
+        trade = active_trade
+
+        try:
+            ticker = await asyncio.to_thread(exchange.fetch_ticker, trade["symbol"])
+            market_price = ticker.get("last")
+
+            if market_price is None or market_price <= 0:
+                await asyncio.sleep(2)
+                continue
+
+            market_price = float(market_price)
+
+            if market_price > trade["highest_price"]:
+                trade["highest_price"] = market_price
+
+            highest_price = trade["highest_price"]
+            gain_from_entry = (highest_price - trade["entry_price"]) / trade["entry_price"]
+
+            if gain_from_entry >= TRAIL_ACTIVATION_PCT:
+                trade["trailing_active"] = True
+                new_trailing_stop = highest_price * (1 - TRAIL_DISTANCE_PCT)
+                if trade["trailing_stop"] is None:
+                    trade["trailing_stop"] = new_trailing_stop
+                else:
+                    trade["trailing_stop"] = max(trade["trailing_stop"], new_trailing_stop)
+
+            elapsed = time.time() - trade["entry_time"]
+
+            if market_price <= trade["sl"]:
+                await close_paper_trade(market_price, "STOP_LOSS")
+                break
+
+            if trade["trailing_active"] and trade["trailing_stop"] is not None and market_price <= trade["trailing_stop"]:
+                await close_paper_trade(market_price, "TRAILING_STOP")
+                break
+
+            if market_price >= trade["tp"]:
+                await close_paper_trade(market_price, "TAKE_PROFIT")
+                break
+
+            if elapsed >= MAX_TRADE_DURATION:
+                await close_paper_trade(market_price, "TIMEOUT")
+                break
+
+            trailing_text = f"{trade['trailing_stop']:.8g}" if trade["trailing_stop"] is not None else "غير مفعّل"
+
+            print(
+                f"\r[{trade['symbol']}] السعر: {market_price:.8g} | TP: {trade['tp']:.8g} | Trailing: {trailing_text}",
+                end="",
+                flush=True
+            )
+
+            await asyncio.sleep(2)
+
+        except Exception as exc:
+            print(f"\nخطأ في المراقبة: {exc}")
+            await asyncio.sleep(3)
+
+
+async def main():
+    print("=" * 60)
+    print("بوت الارتداد السريع والمرن (VAL 7 أيام) — تداول افتراضي")
+    print(f"رأس المال الأولي: {INITIAL_CAPITAL:.2f} USDT")
+    print("=" * 60)
+
+    send_telegram_message("🤖 بدأ بوت الارتداد السريع والمرن بنجاح.")
+
+    while True:
+        try:
+            if active_trade is not None:
+                await monitor_active_trade()
+            else:
+                await scan_for_candidates()
+                await asyncio.sleep(5)
+        except Exception as exc:
+            print(f"\nخطأ رئيسي: {exc}")
+            await asyncio.sleep(5)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nتم إيقاف البوت.")
